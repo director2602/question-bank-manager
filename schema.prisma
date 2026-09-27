@@ -1,0 +1,782 @@
+// ─────────────────────────────────────────────────────────────────────────
+// Question Bank Manager & Paper Generator — Prisma schema
+//
+// Design principles enforced by this schema (see README.md § Business Rules):
+//   1. Question CONTENT (question_versions) is fully separated from
+//      METADATA/TAGS (questions.subjectId/examClassId/codeId/difficultyId).
+//      Editing a tag never touches question_versions; editing content always
+//      creates a brand-new immutable question_versions row.
+//   2. Lookup tables (subjects, exam_classes, codes, difficulty_levels,
+//      roles) constrain tag values at the database level — invalid values
+//      cannot be inserted because they must satisfy a foreign key.
+//   3. Optimistic locking: `questions.rowVersion` (and `papers.rowVersion`)
+//      is incremented on every update and checked by the API layer so a
+//      stale write is rejected with a 409 instead of silently overwriting
+//      another user's change.
+//   4. Papers never reference "live" question content directly — every
+//      paper_questions row pins a questionVersionId, and every save creates
+//      an immutable paper_versions snapshot, so historical papers remain
+//      stable even after the underlying question is edited.
+//
+// All fields use explicit @map(...) to snake_case column names so the raw
+// SQL in supabase/sql/*.sql (which uses conventional snake_case, unquoted
+// identifiers) matches exactly what Prisma Client reads/writes at runtime.
+// ─────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ── Reference / lookup tables ──────────────────────────────────────────────
+
+model Role {
+  id          String    @id @default(uuid()) @db.Uuid
+  code        RoleCode  @unique
+  label       String
+  description String?
+  profiles    Profile[]
+
+  @@map("roles")
+}
+
+enum RoleCode {
+  ADMIN
+  EDITOR
+  VIEWER
+}
+
+model Subject {
+  id        String     @id @default(uuid()) @db.Uuid
+  code      String     @unique
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+  chapters  Chapter[]
+
+  @@map("subjects")
+}
+
+// Chapters/Topics constrain which questions the Advanced Paper Builder's
+// selection engine can pick for a section (see README.md § Advanced Paper
+// Builder). Scoped to a Subject (a Chapter belongs to exactly one Subject);
+// a Topic belongs to exactly one Chapter. Both are nullable on Question —
+// tagging by chapter/topic is optional, existing untagged questions remain
+// fully usable everywhere they always were.
+model Chapter {
+  id        String     @id @default(uuid()) @db.Uuid
+  subjectId String     @db.Uuid @map("subject_id")
+  subject   Subject    @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  code      String
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+  topics    Topic[]
+
+  @@unique([subjectId, code])
+  @@index([subjectId])
+  @@map("chapters")
+}
+
+model Topic {
+  id        String     @id @default(uuid()) @db.Uuid
+  chapterId String     @db.Uuid @map("chapter_id")
+  chapter   Chapter    @relation(fields: [chapterId], references: [id], onDelete: Restrict)
+  code      String
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+
+  @@unique([chapterId, code])
+  @@index([chapterId])
+  @@map("topics")
+}
+
+model ExamClass {
+  id        String     @id @default(uuid()) @db.Uuid
+  code      String     @unique
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+
+  @@map("exam_classes")
+}
+
+model Code {
+  id        String     @id @default(uuid()) @db.Uuid
+  code      String     @unique
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+
+  @@map("codes")
+}
+
+model DifficultyLevel {
+  id        String     @id @default(uuid()) @db.Uuid
+  code      String     @unique
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+
+  @@map("difficulty_levels")
+}
+
+// A standalone "target exam" tag (NEET / IIT-JEE Main / IIT-JEE Advance /
+// Foundation) — deliberately its own lookup, independent of ExamClass
+// (which bundles a class number with a broad exam type, e.g. "11 JEE") and
+// independent of Code (a plain set letter A/B/C/D). Nullable on Question:
+// every question created before this feature, or never tagged with one,
+// remains fully valid and untouched.
+model ExamCategory {
+  id        String     @id @default(uuid()) @db.Uuid
+  code      String     @unique
+  label     String
+  sortOrder Int        @default(0) @map("sort_order")
+  isActive  Boolean    @default(true) @map("is_active")
+  questions Question[]
+
+  @@map("exam_categories")
+}
+
+// ── Users ───────────────────────────────────────────────────────────────
+
+model Profile {
+  id        String   @id @db.Uuid
+  email     String   @unique
+  fullName  String?  @map("full_name")
+  roleId    String   @db.Uuid @map("role_id")
+  role      Role     @relation(fields: [roleId], references: [id])
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  questionsCreated Question[]        @relation("QuestionCreatedBy")
+  versionsCreated  QuestionVersion[] @relation("VersionCreatedBy")
+  imagesUploaded   QuestionImage[]   @relation("ImageUploadedBy")
+  papersCreated    Paper[]           @relation("PaperCreatedBy")
+  paperVersions    PaperVersion[]    @relation("PaperVersionCreatedBy")
+  foldersCreated   PaperFolder[]     @relation("FolderCreatedBy")
+  importJobsCreated ImportJob[]      @relation("ImportJobCreatedBy")
+  coverTemplatesCreated CoverTemplate[] @relation("CoverTemplateCreatedBy")
+  auditLogs        AuditLog[]
+
+  @@index([roleId])
+  @@map("profiles")
+}
+
+// ── Questions ───────────────────────────────────────────────────────────
+
+enum QuestionStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+// Drives BOTH how a question is validated/rendered (MCQ needs options +a
+// single-letter answer, SUBJECTIVE needs an answer-space allowance,
+// INTEGER needs a numeric correctAnswer) and how the Advanced Paper
+// Builder's section selection engine filters candidates. Defaults to MCQ
+// so every pre-existing question (which is option-based) is correctly
+// classified without a backfill migration having to guess.
+enum QuestionType {
+  MCQ
+  SUBJECTIVE
+  INTEGER
+}
+
+model Question {
+  id             String @id @default(uuid()) @db.Uuid
+  questionNumber String @map("question_number")
+
+  subjectId    String          @db.Uuid @map("subject_id")
+  subject      Subject         @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  examClassId  String          @db.Uuid @map("exam_class_id")
+  examClass    ExamClass       @relation(fields: [examClassId], references: [id], onDelete: Restrict)
+  codeId       String          @db.Uuid @map("code_id")
+  code         Code            @relation(fields: [codeId], references: [id], onDelete: Restrict)
+  difficultyId String          @db.Uuid @map("difficulty_id")
+  difficulty   DifficultyLevel @relation(fields: [difficultyId], references: [id], onDelete: Restrict)
+
+  questionType QuestionType @default(MCQ) @map("question_type")
+  chapterId    String?      @db.Uuid @map("chapter_id")
+  chapter      Chapter?     @relation(fields: [chapterId], references: [id], onDelete: SetNull)
+  topicId      String?      @db.Uuid @map("topic_id")
+  topic        Topic?       @relation(fields: [topicId], references: [id], onDelete: SetNull)
+
+  // Optional standalone "target exam" tag — see ExamCategory's doc comment.
+  examCategoryId String?       @db.Uuid @map("exam_category_id")
+  examCategory   ExamCategory? @relation(fields: [examCategoryId], references: [id], onDelete: SetNull)
+
+  status QuestionStatus @default(ACTIVE)
+
+  currentVersionId String?           @unique @db.Uuid @map("current_version_id")
+  currentVersion   QuestionVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  versions         QuestionVersion[] @relation("QuestionVersions")
+
+  normalizedTextHash String? @map("normalized_text_hash")
+
+  rowVersion Int @default(1) @map("row_version")
+
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("QuestionCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  paperQuestions PaperQuestion[]
+
+  @@index([subjectId, examClassId])
+  @@index([subjectId, examClassId, difficultyId])
+  @@index([subjectId, examClassId, codeId, difficultyId])
+  @@index([questionNumber])
+  @@index([createdAt])
+  @@index([status])
+  @@index([normalizedTextHash])
+  @@index([chapterId])
+  @@index([topicId])
+  @@index([questionType])
+  @@index([examCategoryId])
+  @@map("questions")
+}
+
+model QuestionVersion {
+  id            String   @id @default(uuid()) @db.Uuid
+  questionId    String   @db.Uuid @map("question_id")
+  question      Question @relation("QuestionVersions", fields: [questionId], references: [id], onDelete: Cascade)
+  versionNumber Int      @map("version_number")
+
+  questionText  String  @map("question_text")
+  optionA       String? @map("option_a")
+  optionB       String? @map("option_b")
+  optionC       String? @map("option_c")
+  optionD       String? @map("option_d")
+  correctAnswer String? @map("correct_answer")
+  explanation   String?
+  // SUBJECTIVE-only: the marking scheme/rubric a checker uses to award
+  // partial marks. Deliberately a separate field from `explanation` (the
+  // student-facing solution shown on an answer key) and from
+  // `correctAnswer` (the "expected answer" summary) — both are internal,
+  // never rendered on the student-facing paper, exactly like correctAnswer.
+  markingScheme String? @map("marking_scheme")
+
+  changeNote String? @map("change_note")
+
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("VersionCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  currentFor     Question?       @relation("CurrentVersion")
+  images         QuestionImage[]
+  paperQuestions PaperQuestion[]
+
+  @@unique([questionId, versionNumber])
+  @@index([questionId])
+  @@map("question_versions")
+}
+
+model QuestionImage {
+  id String @id @default(uuid()) @db.Uuid
+
+  questionVersionId String?          @db.Uuid @map("question_version_id")
+  questionVersion   QuestionVersion? @relation(fields: [questionVersionId], references: [id], onDelete: Cascade)
+
+  storagePath  String   @map("storage_path")
+  fileName     String   @map("file_name")
+  mimeType     String   @map("mime_type")
+  sizeBytes    Int      @map("size_bytes")
+  sortOrder    Int      @default(0) @map("sort_order")
+  altText      String?  @map("alt_text")
+  // Which MCQ option (A/B/C/D) this image illustrates — null means it's a
+  // general question image (the original, still-supported behavior). Lets
+  // an option itself be a diagram/figure instead of only text, and is set
+  // once at upload time (not changed afterwards), so every place that
+  // already attaches images by id (create/edit/CSV/PDF/handwritten import)
+  // needs no changes — the slot travels with the image row itself.
+  optionSlot   String?  @map("option_slot")
+  uploadedById String   @db.Uuid @map("uploaded_by_id")
+  uploadedBy   Profile  @relation("ImageUploadedBy", fields: [uploadedById], references: [id])
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([questionVersionId])
+  @@map("question_images")
+}
+
+// ── Handwritten PDF import (async processing job) ──────────────────────────
+
+// Only one kind today (HANDWRITTEN_PDF) — kept as an enum rather than a
+// bare boolean so a future import kind (e.g. HANDWRITTEN_IMAGE_SET) can be
+// added without a schema rewrite. COVER_DESIGN_ANALYSIS (Cover Page
+// Designer's "Analyze Design" step) reuses this exact table/pattern rather
+// than a parallel job model — subjectId/examClassId/codeId are simply left
+// null (irrelevant to a cover analysis), and resultJson holds a
+// CoverAnalysisResult (src/lib/ai/coverDesignAnalysis.ts) instead of a
+// HandwritingExtractionResult.
+enum ImportJobKind {
+  HANDWRITTEN_PDF
+  COVER_DESIGN_ANALYSIS
+}
+
+// PENDING: row created, processing not started yet. PROCESSING: the
+// Claude-vision pipeline is running (see `stage` for a human-readable
+// progress message). REVIEW: extraction finished — `resultJson` holds the
+// candidate questions/diagrams waiting for the user's edits before they're
+// saved to the real Question Bank. FAILED: processing errored out;
+// `errorMessage` explains why (never a raw stack trace). Nothing is ever
+// silently discarded — a FAILED job still keeps the original file.
+enum ImportJobStatus {
+  PENDING
+  PROCESSING
+  REVIEW
+  FAILED
+}
+
+// One row per handwritten-PDF upload. This is the "safe asynchronous
+// processing pattern" required when no queue/worker system exists (see
+// README § Handwritten PDF Import): the upload request creates this row and
+// returns immediately with its id; a detached async function (this app runs
+// as a persistent Node server, not ephemeral serverless, so a promise
+// started here safely keeps running after the response is sent) drives the
+// row through PENDING → PROCESSING → REVIEW/FAILED while the browser polls
+// GET /api/questions/bulk-import/handwritten/[jobId] for `stage`/status.
+model ImportJob {
+  id   String        @id @default(uuid()) @db.Uuid
+  kind ImportJobKind @default(HANDWRITTEN_PDF)
+
+  status ImportJobStatus @default(PENDING)
+  // Human-readable current step, e.g. "Reading handwriting…" / "Detecting
+  // diagrams…" / "Generating professional diagrams…" — shown verbatim in
+  // the upload wizard's progress UI. Never fabricated per-page counters
+  // beyond what the pipeline can actually report (see extractHandwrittenAI).
+  stage String?
+
+  totalPages Int? @map("total_pages")
+
+  originalFileName    String @map("original_file_name")
+  // The untouched original upload — NEVER deleted or overwritten, even
+  // after successful import, per "never destroy the original source file".
+  originalStoragePath String @map("original_storage_path")
+
+  // Optional pre-selected scope (Subject/Class/Code) the user chose before
+  // uploading, applied to every extracted row as a starting default — still
+  // fully editable per-row on the review screen, never force-applied.
+  subjectId   String? @db.Uuid @map("subject_id")
+  examClassId String? @db.Uuid @map("exam_class_id")
+  codeId      String? @db.Uuid @map("code_id")
+
+  // Extracted candidate rows once status=REVIEW: { questions: [...] } — see
+  // HandwrittenExtractionResult in src/lib/pdf/extractHandwrittenAI.ts for
+  // the exact shape (per-question AND per-diagram confidence, original vs.
+  // generated diagram references, needsReview flags). Kept as JSON, same
+  // write-once-read-together pattern as PaperSection.typeConfig — this is
+  // never queried/filtered on its own, only read back whole by the review
+  // screen and the confirm endpoint.
+  resultJson Json? @map("result_json")
+
+  errorMessage String? @map("error_message")
+
+  // Set once the review screen's rows are saved into the Question Bank —
+  // the job stays REVIEW status (resultJson is kept, never cleared) so the
+  // review screen remains inspectable, but the UI treats a confirmed job
+  // as done and won't let it be re-confirmed / double-imported.
+  confirmedAt            DateTime? @map("confirmed_at")
+  confirmedQuestionCount Int?      @map("confirmed_question_count")
+
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("ImportJobCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([createdById])
+  @@index([status])
+  @@map("import_jobs")
+}
+
+// ── Papers ──────────────────────────────────────────────────────────────
+
+// RANDOM/MANUAL are the original flat-generator modes (unchanged, still
+// used by PaperGeneratorForm/api/papers). HYBRID is new — the Advanced
+// Paper Builder's "system auto-generates, user can replace individual
+// questions" mode (see api/papers/sectioned).
+enum PaperMode {
+  RANDOM
+  MANUAL
+  HYBRID
+}
+
+enum PaperStatus {
+  DRAFT
+  FINAL
+}
+
+model Paper {
+  id          String @id @default(uuid()) @db.Uuid
+  paperNumber Int    @default(autoincrement()) @map("paper_number")
+  title       String
+  // Optional subtitle shown under the main title on the cover (Advanced
+  // Paper Builder custom heading — falls back to the app default (no
+  // subtitle line) when left empty, never fabricated).
+  subtitle    String?
+
+  mode   PaperMode
+  status PaperStatus @default(DRAFT)
+
+  generationFilters Json @map("generation_filters")
+
+  // Full custom-heading configuration from the Advanced Paper Builder
+  // (which optional fields are shown — school name/exam/subject/class/
+  // academic year/time/max marks/roll number/student name/date — plus
+  // their custom text and basic style: font/size/bold/alignment/logo
+  // position+size). Null for every paper created via the original flat
+  // generator, which keeps using the discrete instituteName/examName/etc.
+  // columns below exactly as before.
+  headingConfig Json? @map("heading_config")
+
+  instituteName String?   @map("institute_name")
+  logoUrl       String?   @map("logo_url")
+  examName      String?   @map("exam_name")
+  subjectLabel  String?   @map("subject_label")
+  classLabel    String?   @map("class_label")
+  examDate      DateTime? @map("exam_date")
+  examTime      String?   @map("exam_time")
+  maxMarks      Int?      @map("max_marks")
+  instructions  String?
+  headerText    String?   @map("header_text")
+  footerText    String?   @map("footer_text")
+
+  allowReuseOfPastQuestions Boolean @default(false) @map("allow_reuse_of_past_questions")
+
+  // ── Cover Page Designer (add-on — see src/lib/validation/coverDesign.ts)
+  // Null for every paper that predates this feature or never opened the
+  // designer — renderPaperHtml()/buildPaperDocxBuffer() fall straight back
+  // to the original hardcoded renderCoverPage()/buildCoverParagraphs() in
+  // that case, so this is purely additive. Once set, it's a full
+  // CoverDesign (pageSize/background/elements[]/settings) validated by
+  // coverDesignSchema — never a bare screenshot, per "save editable design
+  // information, not only a screenshot".
+  coverDesign Json? @map("cover_design")
+  // Preserves the pre-existing, previously-implicit behavior (the cover was
+  // ALWAYS its own page 1, unconditionally) as an explicit, defaulted-on
+  // toggle — see renderPaperHtml's `showCover` and README § Cover Page
+  // Designer for why this default must never silently change.
+  separateFrontPage Boolean @default(true) @map("separate_front_page")
+
+  folderId String?      @db.Uuid @map("folder_id")
+  folder   PaperFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  rowVersion Int @default(1) @map("row_version")
+
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("PaperCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  questions PaperQuestion[]
+  sections  PaperSection[]
+  versions  PaperVersion[]
+  settings  PaperSettings?
+
+  @@index([createdAt])
+  @@index([status])
+  @@index([folderId])
+  @@map("papers")
+}
+
+// A flat (non-nested) folder used purely to organize the Saved Papers list.
+// Deleting a folder must NEVER delete the papers inside it — onDelete:
+// SetNull means a paper whose folder is deleted simply falls back to
+// "Uncategorized" (folderId = null), exactly like every paper starts out.
+model PaperFolder {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @unique
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("FolderCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  papers Paper[]
+
+  @@map("paper_folders")
+}
+
+enum PageSize {
+  A4
+  LETTER
+  LEGAL
+}
+
+enum PageOrientation {
+  PORTRAIT
+  LANDSCAPE
+}
+
+enum ImageAlignment {
+  LEFT
+  CENTER
+  RIGHT
+}
+
+// 1,2,3 / Q1,Q2,Q3 / 1(a),1(b),1(c) — applied consistently across the whole
+// paper by the renderer (paperHtml.ts/paperDocx.ts), never per-question.
+enum QuestionNumberingStyle {
+  PLAIN
+  Q_PREFIX
+  LETTERED
+}
+
+// [2 Marks] / (2) / [2] — the marks annotation shown next to each question.
+enum MarksDisplayStyle {
+  BRACKET_MARKS
+  PAREN_NUMBER
+  BRACKET_NUMBER
+}
+
+// Per-paper layout/typography/export configuration. One row per paper,
+// created lazily with the app defaults (2 columns / Calibri / 11pt) the
+// first time it's requested, and applied identically by the print view,
+// the PDF exporter, and the DOCX exporter — one source of truth, not three.
+model PaperSettings {
+  id      String @id @default(uuid()) @db.Uuid
+  paperId String @unique @db.Uuid @map("paper_id")
+  paper   Paper  @relation(fields: [paperId], references: [id], onDelete: Cascade)
+
+  pageSize    PageSize        @default(A4) @map("page_size")
+  orientation PageOrientation @default(PORTRAIT)
+
+  marginTopMm    Float @default(18) @map("margin_top_mm")
+  marginBottomMm Float @default(18) @map("margin_bottom_mm")
+  marginLeftMm   Float @default(16) @map("margin_left_mm")
+  marginRightMm  Float @default(16) @map("margin_right_mm")
+
+  columns         Int     @default(2)
+  columnGapMm     Float   @default(8) @map("column_gap_mm")
+  showHeader      Boolean @default(true) @map("show_header")
+  showFooter      Boolean @default(true) @map("show_footer")
+  showPageNumbers Boolean @default(true) @map("show_page_numbers")
+
+  fontFamily        String @default("Calibri") @map("font_family")
+  fontSizePt         Float @default(11) @map("font_size_pt")
+  lineSpacing        Float @default(1.5) @map("line_spacing")
+  questionSpacingPx  Float @default(16) @map("question_spacing_px")
+  optionSpacingPx    Float @default(3)  @map("option_spacing_px")
+
+  imageQualityPercent Int            @default(90) @map("image_quality_percent")
+  maxImageWidthMm     Float          @default(85) @map("max_image_width_mm")
+  imageAlignment      ImageAlignment @default(LEFT) @map("image_alignment")
+
+  // Advanced Paper Builder (section-aware rendering) — applied consistently
+  // across the whole paper, same one-source-of-truth pattern as every other
+  // field on this model.
+  questionNumberingStyle QuestionNumberingStyle @default(Q_PREFIX) @map("question_numbering_style")
+  marksDisplayStyle      MarksDisplayStyle      @default(BRACKET_MARKS) @map("marks_display_style")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("paper_settings")
+}
+
+// Number restarts at 1 within a section (RESTART) or keeps counting on from
+// the previous section (CONTINUE, the default per the spec's "defaults to
+// continuous numbering unless otherwise specified").
+enum SectionNumberingMode {
+  CONTINUE
+  RESTART
+}
+
+// Reserved blank space after a subjective question for the candidate to
+// write their answer. NONE/SMALL/MEDIUM/LARGE map to fixed heights in the
+// renderer; CUSTOM uses customAnswerSpaceMm.
+enum AnswerSpaceSize {
+  NONE
+  SMALL
+  MEDIUM
+  LARGE
+  CUSTOM
+}
+
+// A fully custom, user-defined section of a paper (Advanced Paper Builder).
+// Section order is `position` — "the order selected here must be the order
+// used in the final paper" (spec) — and PaperQuestion.position stays the
+// single global ordering field across all sections, so no other query needs
+// to change to stay section-aware (buildPaperSnapshot's existing
+// orderBy:{position:'asc'} already yields sections in order, contiguous).
+model PaperSection {
+  id      String @id @default(uuid()) @db.Uuid
+  paperId String @db.Uuid @map("paper_id")
+  paper   Paper  @relation(fields: [paperId], references: [id], onDelete: Cascade)
+
+  position Int
+  // Section Label (e.g. "A", "I") and Section Title (e.g. "Multiple Choice
+  // Questions") are independently configurable — never forced to "Section
+  // A/B/C" as the spec explicitly requires.
+  label        String
+  title        String
+  instructions String?
+
+  numberingMode SectionNumberingMode @default(CONTINUE) @map("numbering_mode")
+  answerSpace   AnswerSpaceSize      @default(MEDIUM) @map("answer_space")
+  customAnswerSpaceMm Float?         @map("custom_answer_space_mm")
+
+  // The per-type question-count/marks/difficulty/selection-mode
+  // configuration this section was built from — e.g.
+  // [{questionType:"MCQ", count:10, marksPerQuestion:1, difficultyId:...}].
+  // Kept as JSON (like Paper.generationFilters) rather than a further
+  // normalized table, since it's write-once-read-together configuration,
+  // not something ever queried/filtered on its own.
+  typeConfig Json @map("type_config")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  questions PaperQuestion[]
+
+  @@unique([paperId, position])
+  @@index([paperId])
+  @@map("paper_sections")
+}
+
+model PaperQuestion {
+  id                String          @id @default(uuid()) @db.Uuid
+  paperId           String          @db.Uuid @map("paper_id")
+  paper             Paper           @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  questionId        String          @db.Uuid @map("question_id")
+  question          Question        @relation(fields: [questionId], references: [id], onDelete: Restrict)
+  questionVersionId String          @db.Uuid @map("question_version_id")
+  questionVersion   QuestionVersion @relation(fields: [questionVersionId], references: [id], onDelete: Restrict)
+
+  position Int
+  marks    Float?
+
+  // Replaces the old, always-unused `sectionLabel: String?` column (never
+  // set anywhere in the codebase — confirmed by inspection) with a real FK
+  // into PaperSection. Null for every paper created via the original flat
+  // generator (no sections involved at all); set for every paper created
+  // via the Advanced Paper Builder. onDelete:SetNull so a deleted section
+  // never cascades into deleting the questions that were in it.
+  sectionId String?       @db.Uuid @map("section_id")
+  section   PaperSection? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  // ── Paper-scoped content overrides ───────────────────────────────────
+  // Optional, per-paper replacements for this question's displayed text —
+  // set only when someone explicitly edits a question's wording/options
+  // from inside THIS paper (see PATCH /api/papers/:id/questions/:pqId).
+  // When null (the default — every existing row, and every row nobody has
+  // touched), the renderer falls straight through to the live
+  // QuestionVersion fields exactly as before, so this is purely additive:
+  // it never changes what already-generated papers show. When set, it
+  // takes precedence ONLY for this one paper_questions row — the master
+  // Question Bank and every other paper referencing the same question are
+  // completely unaffected, per "editing inside a paper must apply only to
+  // that paper."
+  questionTextOverride  String? @map("question_text_override")
+  optionAOverride       String? @map("option_a_override")
+  optionBOverride       String? @map("option_b_override")
+  optionCOverride       String? @map("option_c_override")
+  optionDOverride       String? @map("option_d_override")
+  correctAnswerOverride String? @map("correct_answer_override")
+  explanationOverride   String? @map("explanation_override")
+  markingSchemeOverride String? @map("marking_scheme_override")
+
+  @@unique([paperId, questionId])
+  @@index([paperId, position])
+  @@index([sectionId])
+  @@map("paper_questions")
+}
+
+model PaperVersion {
+  id            String   @id @default(uuid()) @db.Uuid
+  paperId       String   @db.Uuid @map("paper_id")
+  paper         Paper    @relation(fields: [paperId], references: [id], onDelete: Cascade)
+  versionNumber Int      @map("version_number")
+
+  snapshot Json
+  settings Json
+
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("PaperVersionCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@unique([paperId, versionNumber])
+  @@index([paperId])
+  @@map("paper_versions")
+}
+
+// ── Audit log ───────────────────────────────────────────────────────────
+
+model AuditLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String?  @db.Uuid @map("user_id")
+  user          Profile? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action        String
+  entityType    String   @map("entity_type")
+  entityId      String?  @map("entity_id")
+  description   String
+  previousValue Json?    @map("previous_value")
+  newValue      Json?    @map("new_value")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([userId])
+  @@map("audit_logs")
+}
+
+// ── Institute / paper templates ────────────────────────────────────────
+
+model Presence {
+  userId     String   @id @db.Uuid @map("user_id")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+
+  @@map("presence")
+}
+
+model PaperTemplate {
+  id            String   @id @default(uuid()) @db.Uuid
+  name          String
+  instituteName String   @map("institute_name")
+  logoUrl       String?  @map("logo_url")
+  headerText    String?  @map("header_text")
+  footerText    String?  @map("footer_text")
+  instructions  String?
+  isDefault     Boolean  @default(false) @map("is_default")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("paper_templates")
+}
+
+// A reusable, named Cover Page design (Cover Page Designer's "Save as Cover
+// Template" / "Cover Templates" list) — deliberately a SEPARATE model from
+// PaperTemplate above: that one is flat institute-letterhead data used to
+// prefill the original flat Paper Generator's fields, while this one is a
+// full visual layout (same CoverDesign JSON shape as Paper.coverDesign —
+// see src/lib/validation/coverDesign.ts). "Use" a template copies `design`
+// onto a Paper's own coverDesign column (a decoupled snapshot, same pattern
+// as every other "apply a template" flow in this app — editing the
+// template afterward never retroactively changes papers already using it).
+model CoverTemplate {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  design Json
+
+  isDefault Boolean @default(false) @map("is_default")
+
+  createdById String   @db.Uuid @map("created_by_id")
+  createdBy   Profile  @relation("CoverTemplateCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([createdById])
+  @@map("cover_templates")
+}
